@@ -1,0 +1,10 @@
+# Claude Code
+.claude/*
+!.claude/settings.json
+
+# Editors
+.zed/
+.idea/
+
+# macOS
+.DS_Store

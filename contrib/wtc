@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# wtc — personal cmux glue over `wt`: start a work session in the CURRENT cmux
+# workspace. It renames that workspace after the worktree, refreshes the repo's
+# default branch, opens (creating if needed) the worktree, and then the zsh
+# wrapper cd's into it and launches Claude Code.
+#
+# Lives in contrib/ rather than bin/ because it is personal glue, not part of
+# the supported tool: bin/wt and bin/wt-sync stay dependency-free (git and
+# coreutils only), while this file takes on cmux and Claude Code. Published as
+# a working example — copy it and set WTC_START_CMD to fit your own setup.
+#
+# Usage:
+#   wtc [<name>] [wt open options]  rename workspace, open worktree, cd, start
+#   wtc --no-start [<name>]         same, minus launching the start command
+#   wtc --no-fresh [<name>]         skip the fetch + fast-forward of the
+#                                   default branch (passes plain `wt open`)
+#   wtc init zsh                    print the zsh shell integration
+#
+# `cd` cannot cross a process boundary, so the real entry point is the zsh
+# function; add to your zshrc:  eval "$(wtc init zsh)"
+#
+# The wrapper runs $WTC_START_CMD in the worktree (default:
+# claude --permission-mode auto). It is an env var rather than the `cc` alias
+# because zsh expands aliases when a function is parsed, which would silently
+# depend on the order of lines in your zshrc.
+#
+# With no name, wtc prompts for one; an empty answer lets wt generate
+# wt-<MMDD-HHMM>. Outside cmux (plain terminal, socket down) the rename is
+# skipped with a warning and everything else still works.
+#
+# Known unknown: a cmux workspace's cwd is fixed when it is created, and this
+# renames the workspace in place rather than recreating it, so a NEW TAB opened
+# in it may inherit the directory the workspace started in (the main repo)
+# instead of the worktree. Unverified either way. If it bites, the cheap fix is
+# `wt cd <name>` in the new tab; the expensive one is going back to spawning a
+# fresh workspace at the worktree path.
+#
+# stdout is the worktree path, same contract as wt.
+
+set -euo pipefail
+
+log() { printf '[wtc] %s\n' "$*" >&2; }
+die() {
+  printf '[wtc] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  # Print the header comment block: line 2 up to the first non-comment line,
+  # so the range never drifts as the header grows.
+  awk 'NR < 2 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
+  exit "${1:-0}"
+}
+
+# Rename the workspace this shell is running in. Every failure mode is a
+# warning, never fatal: the worktree matters, the label does not.
+rename_workspace() {
+  local title="$1"
+  if [[ -z "${CMUX_WORKSPACE_ID:-}" ]]; then
+    log "not inside a cmux workspace; skipping rename"
+    return 0
+  fi
+  if ! command -v cmux >/dev/null 2>&1; then
+    log "cmux CLI not found; skipping rename"
+    return 0
+  fi
+  if CMUX_QUIET=1 cmux workspace-action --action rename --title "$title" >/dev/null 2>&1; then
+    log "renamed workspace -> $title"
+  else
+    log "workspace rename to '$title' failed (cmux socket unreachable?)"
+  fi
+}
+
+case "${1:-}" in
+  init)
+    [[ "${2:-}" == "zsh" ]] || die "usage: wtc init zsh"
+    # stdout below is meant for: eval "$(wtc init zsh)"
+    cat <<'EOF'
+# wtc shell integration: `wtc [<name>]` renames the current cmux workspace
+# after the worktree, opens/creates it (refreshing the default branch first),
+# cd's there, and starts $WTC_START_CMD. --no-start skips that last step.
+wtc() {
+  case "${1:-}" in
+    init | -h | --help)
+      command wtc "$@"
+      return
+      ;;
+  esac
+  local start=1 dir a
+  local -a args=()
+  for a in "$@"; do
+    if [[ "$a" == "--no-start" ]]; then
+      start=0
+    else
+      args+=("$a")
+    fi
+  done
+  dir="$(command wtc ${args[@]+"${args[@]}"})" || return
+  cd "$dir" || return
+  (( start )) || return 0
+  eval "${WTC_START_CMD:-claude --permission-mode auto}"
+}
+EOF
+    exit 0
+    ;;
+  -h | --help) usage ;;
+esac
+
+command -v wt >/dev/null 2>&1 || die "wt not found in PATH"
+
+# Split our own flags from the ones that belong to `wt open`. The first bare
+# positional is the worktree name; everything else passes through untouched.
+name=""
+fresh=true
+declare -a passthru=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-fresh) fresh=false; shift ;;
+    # Consumed by the zsh wrapper; accepted here so `command wtc --no-start`
+    # is not an error when someone calls the binary directly.
+    --no-start) shift ;;
+    -C | -b | --branch)
+      passthru+=("$1" "${2:?$1 requires a value}")
+      shift 2
+      ;;
+    -*)
+      passthru+=("$1")
+      shift
+      ;;
+    *)
+      if [[ -z "$name" ]]; then
+        name="$1"
+      else
+        passthru+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Prompt when no name was given, so the bare `wtc` is a complete flow.
+if [[ -z "$name" && -r /dev/tty ]]; then
+  printf 'worktree name (empty = generated): ' >&2
+  IFS= read -r name </dev/tty || name=""
+fi
+
+# Rename up front when the name is known: worktree creation can take seconds
+# (wt-sync clones node_modules) and the label is the useful early feedback.
+[[ -z "$name" ]] || rename_workspace "$name"
+
+open_args=()
+$fresh && open_args+=(--fresh)
+[[ -z "$name" ]] || open_args+=("$name")
+
+dir=$(wt open ${open_args[@]+"${open_args[@]}"} ${passthru[@]+"${passthru[@]}"})
+[[ -n "$dir" ]] || die "wt open produced no path"
+
+# A generated name is only known after the fact.
+[[ -n "$name" ]] || rename_workspace "$(basename "$dir")"
+
+printf '%s\n' "$dir"

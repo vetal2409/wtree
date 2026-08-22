@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# wt-sync — bring a linked git worktree's untracked state in line with its
+# source (main) worktree, driven by a per-repo declarative config.
+#
+# Config, read from the SOURCE worktree root:
+#   .worktreesync      lines: "<mode> <path>"    modes: copy | clone | link
+#
+# Path matching:
+#   no slash    depth pattern — matches every untracked/ignored path whose
+#               basename equals it, at any depth (".env" -> ./.env, src/**/.env).
+#               A matched directory collapses to its top-level entry.
+#   leading /   root-anchored literal ("/.env" = the root .env only)
+#   other /     literal repo-relative path ("src/app/.env")
+#
+# Modes:
+#   copy   one-time copy when missing in the target; never overwrites, so a
+#          worktree can diverge freely after creation (.env, seed data, …)
+#   clone  block-sharing tree clone when the target is missing or empty —
+#          APFS clonefile (cp -cR) on macOS, rsync --link-dest hardlinks
+#          elsewhere, --reflink=auto on Linux cp as a last resort. Meant for
+#          big generated dirs (node_modules, .venv) where a plain copy is
+#          slow and doubles disk usage.
+#   link   symlink target -> source so state is shared bidirectionally and
+#          survives worktree deletion (settings, local notes). Refuses to
+#          clobber a diverged regular file — warns and leaves it alone.
+#
+# Idempotent by design: every mode is a guarded no-op when already applied,
+# so it is safe to run from any/all of: a worktree-creation script, an editor
+# post-create hook (Zed create_worktree), or a Claude Code SessionStart hook.
+# Outside a git repo, or when the target IS the main worktree, it exits 0
+# silently so it can be wired unconditionally into hooks.
+#
+# Usage:
+#   wt-sync [<target-worktree>] [--to <path>] [--from <path>] [--dry-run] [--quiet]
+#
+#   --to    target worktree to populate   (default: worktree containing cwd)
+#   --from  source worktree to read from  (default: the repo's main worktree)
+
+set -euo pipefail
+
+QUIET=false
+DRY_RUN=false
+TO=""
+FROM=""
+
+log() { $QUIET || printf '[wt-sync] %s\n' "$*" >&2; }
+warn() { printf '[wt-sync] WARNING: %s\n' "$*" >&2; }
+die() {
+  printf '[wt-sync] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  # Range spans the header comment block (line 2 .. the last '#' doc line);
+  # bump the end line when the header grows so -h stays complete.
+  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --to)
+      TO="${2:?--to requires a path}"
+      shift 2
+      ;;
+    --from)
+      FROM="${2:?--from requires a path}"
+      shift 2
+      ;;
+    --dry-run | -n)
+      DRY_RUN=true
+      shift
+      ;;
+    --quiet | -q)
+      QUIET=true
+      shift
+      ;;
+    --help | -h) usage ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *)
+      [[ -z "$TO" ]] || die "target given twice: '$TO' and '$1'"
+      TO="$1"
+      shift
+      ;;
+  esac
+done
+
+# ---- resolve source and target worktrees ---------------------------------
+
+if [[ -z "$TO" ]]; then
+  if ! TO=$(git rev-parse --show-toplevel 2>/dev/null); then
+    log "cwd is not inside a git repo; nothing to sync"
+    exit 0
+  fi
+else
+  [[ -d "$TO" ]] || die "target worktree does not exist: $TO"
+  TO=$(cd "$TO" && pwd)
+  git -C "$TO" rev-parse --show-toplevel >/dev/null 2>&1 ||
+    die "target is not inside a git repo: $TO"
+fi
+
+if [[ -z "$FROM" ]]; then
+  # The repo's common .git dir is shared by all worktrees; its parent is the
+  # main worktree. Standard `git worktree add` layouts only.
+  FROM=$(dirname "$(git -C "$TO" rev-parse --path-format=absolute --git-common-dir)")
+else
+  [[ -d "$FROM" ]] || die "source worktree does not exist: $FROM"
+  FROM=$(cd "$FROM" && pwd)
+fi
+
+if [[ "$FROM" == "$TO" ]]; then
+  log "target is the source worktree itself; nothing to sync"
+  exit 0
+fi
+
+# ---- locate config --------------------------------------------------------
+
+CONFIG="$FROM/.worktreesync"
+if [[ ! -f "$CONFIG" ]]; then
+  log "no .worktreesync in $FROM; nothing to sync"
+  exit 0
+fi
+log "config: $CONFIG -> $TO"
+
+# ---- primitives -----------------------------------------------------------
+
+# Plain copy of a file or directory, using cheap COW where the OS offers it.
+fast_copy() {
+  local src="$1" dst="$2"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    cp -cR "$src" "$dst" 2>/dev/null || cp -R "$src" "$dst"
+  else
+    cp -R --reflink=auto "$src" "$dst" 2>/dev/null || cp -R "$src" "$dst"
+  fi
+}
+
+do_copy() {
+  local src="$1" dst="$2"
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    return 0
+  fi
+  if $DRY_RUN; then
+    log "would copy $src -> $dst"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dst")"
+  fast_copy "$src" "$dst"
+  log "copied $dst"
+}
+
+# Clone a directory tree with block sharing. Skips when the destination is
+# already populated so it never stomps a real install. Files fall back to copy.
+do_clone() {
+  local src="$1" dst="$2"
+  if [[ ! -d "$src" ]]; then
+    do_copy "$src" "$dst"
+    return 0
+  fi
+  if [[ -d "$dst" ]] && [[ -n "$(ls -A "$dst" 2>/dev/null)" ]]; then
+    return 0
+  fi
+  if $DRY_RUN; then
+    log "would clone $src -> $dst"
+    return 0
+  fi
+  mkdir -p "$dst"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # `src/.` = "contents of src, dotfiles included" in BSD cp.
+    if ! cp -cR "$src/." "$dst/" 2>/dev/null; then
+      warn "APFS clone unavailable for $src; falling back to full copy"
+      cp -R "$src/." "$dst/"
+    fi
+  elif command -v rsync >/dev/null 2>&1; then
+    # --link-dest at the source itself hardlinks every file instead of copying.
+    rsync -aH --link-dest="$src/" "$src/" "$dst/"
+  else
+    cp -R --reflink=auto "$src/." "$dst/" 2>/dev/null || cp -R "$src/." "$dst/"
+  fi
+  log "cloned $dst"
+}
+
+# Symlink dst -> src with divergence protection: an existing regular file is
+# only replaced when byte-identical to the source; otherwise we warn and keep
+# the local version so a worktree's edits are never silently lost.
+do_link() {
+  local src="$1" dst="$2"
+  if [[ -L "$dst" ]] && [[ "$(readlink "$dst")" == "$src" ]]; then
+    return 0
+  fi
+  if [[ -e "$dst" && ! -L "$dst" ]]; then
+    if [[ -f "$dst" && -f "$src" ]] && cmp -s "$src" "$dst"; then
+      $DRY_RUN || rm -f "$dst"
+    else
+      warn "$dst differs from $src; leaving as-is to preserve local state"
+      return 0
+    fi
+  fi
+  if $DRY_RUN; then
+    log "would symlink $dst -> $src"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dst")"
+  rm -f "$dst"
+  ln -s "$src" "$dst"
+  log "symlinked $dst -> $src"
+}
+
+# Dispatch one resolved src/dst to the primitive for its mode.
+apply_mode() {
+  local mode="$1" src="$2" dst="$3"
+  case "$mode" in
+    copy) do_copy "$src" "$dst" ;;
+    clone) do_clone "$src" "$dst" ;;
+    link) do_link "$src" "$dst" ;;
+  esac
+}
+
+# ---- apply config ---------------------------------------------------------
+
+# Untracked + gitignored paths in the source, used to expand depth patterns
+# (bare names with no slash, matched by basename at any depth). --directory
+# collapses a wholly-ignored dir (e.g. node_modules/) to a single entry, so it
+# is one match, not thousands. Computed once; empty if git is unavailable.
+depth_candidates=()
+if command -v git >/dev/null 2>&1; then
+  while IFS= read -r -d '' _e; do
+    depth_candidates+=("$_e")
+  done < <(git -C "$FROM" ls-files --others --ignored --exclude-standard --directory -z 2>/dev/null)
+fi
+
+LINENO_CFG=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  LINENO_CFG=$((LINENO_CFG + 1))
+  # Trim surrounding whitespace; skip blanks and comments.
+  line="${line#"${line%%[![:space:]]*}"}"
+  line="${line%"${line##*[![:space:]]}"}"
+  [[ -z "$line" || "$line" == \#* ]] && continue
+
+  mode="${line%%[[:space:]]*}"
+  path="${line#*[[:space:]]}"
+  path="${path#"${path%%[![:space:]]*}"}"
+  if [[ "$mode" == "$line" || -z "$path" ]]; then
+    warn "$CONFIG:$LINENO_CFG: expected '<mode> <path>', got '$line'; skipping"
+    continue
+  fi
+
+  case "$mode" in
+    copy | clone | link) ;;
+    *)
+      warn "$CONFIG:$LINENO_CFG: unknown mode '$mode'; skipping"
+      continue
+      ;;
+  esac
+
+  if [[ "$path" == *..* ]]; then
+    warn "$CONFIG:$LINENO_CFG: path must not contain '..': '$path'; skipping"
+    continue
+  fi
+
+  # Classify: leading '/' = root-anchored literal; any other '/' = literal path
+  # (today's behavior); no '/' = depth pattern (basename match at any depth).
+  if [[ "$path" == /* ]]; then
+    kind=literal
+    path="${path#/}"
+  elif [[ "$path" == */* ]]; then
+    kind=literal
+  else
+    kind=depth
+  fi
+  path="${path%/}"
+  if [[ -z "$path" ]]; then
+    warn "$CONFIG:$LINENO_CFG: empty path; skipping"
+    continue
+  fi
+
+  if [[ "$kind" == literal ]]; then
+    src="$FROM/$path"
+    dst="$TO/$path"
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+      log "skip $path (missing in source)"
+      continue
+    fi
+    apply_mode "$mode" "$src" "$dst"
+    continue
+  fi
+
+  # depth pattern: apply the mode to every candidate whose basename matches
+  matched=0
+  for _e in ${depth_candidates[@]+"${depth_candidates[@]}"}; do
+    rel="${_e%/}"
+    [[ "${rel##*/}" == "$path" ]] || continue
+    matched=1
+    apply_mode "$mode" "$FROM/$rel" "$TO/$rel"
+  done
+  if [[ "$matched" -eq 0 ]]; then
+    log "skip $path (no matches)"
+  fi
+done <"$CONFIG"
+
+log "done"

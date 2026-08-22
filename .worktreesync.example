@@ -1,0 +1,33 @@
+# .worktreesync — declarative untracked-state sync, read by `wt-sync` from the
+# SOURCE (main) worktree. Copy this file to `.worktreesync` in your repo root
+# and commit it, so every worktree of the repo gets the same treatment.
+#
+# Format:  <mode> <path>
+#
+# Modes:
+#   copy    one-time copy when missing in the target; never overwrites, so a
+#           worktree can diverge freely after it is created
+#   clone   block-sharing tree clone when the target is missing or empty —
+#           APFS clonefile on macOS, hardlinks elsewhere. For big generated
+#           directories where a plain copy is slow and doubles disk usage.
+#   link    symlink target -> source, so state is shared both ways and
+#           survives worktree deletion. Refuses to clobber a diverged file.
+#
+# Path matching:
+#   .env          no slash   -> depth pattern: every untracked/ignored path
+#                              whose basename is `.env`, at any depth
+#   /.env         leading /  -> root-anchored literal: the root .env only
+#   src/app/.env  other /    -> literal repo-relative path
+#
+# Blank lines and lines starting with # are ignored.
+
+# Big generated trees — cloned, so a new worktree costs almost no extra disk.
+clone node_modules
+clone .venv
+
+# Secrets and local config — copied once, then yours to diverge.
+copy .env
+copy .env.local
+
+# Shared state you want to edit in exactly one place.
+link .claude/settings.local.json

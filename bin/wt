@@ -1,0 +1,987 @@
+#!/usr/bin/env bash
+# wt — create, open, list, and remove git worktrees in one machine-wide place.
+#
+# Layout:   $WT_ROOT/<repo-basename>/<worktree-name>
+#           WT_ROOT defaults to ~/worktrees; export WT_ROOT to relocate
+#
+# Setup:    after creating (or when reusing) a worktree, wt runs wt-sync — the
+#           declarative untracked-state sync driven by the repo's .worktreesync
+#           (entries match by basename at any depth; see `wt-sync -h`).
+#           It is idempotent, so `wt open <name>` is safe to re-run any time.
+#
+# Output:   stdout is ALWAYS the bare worktree path — everything else goes to
+#           stderr — so wt composes with anything:
+#             cd "$(wt open foo)"
+#             cmux "$(wt open foo)"        # open a cmux workspace there
+#             zed "$(wt path foo)"
+#
+# Usage:
+#   wt open [<name>] [options]    open a worktree, creating it if needed
+#   wt sync [<path>]              run wt-sync for a worktree (default: cwd)
+#   wt ls [--safe] [--all]        list worktrees — name, branch, age, status
+#                                 (--safe: only the ones safe to remove)
+#   wt path <name>                print the worktree's directory
+#   wt rm <name> [--force]        remove worktree + branch if merged (--force:
+#                                 dirty tree and unmerged branch too)
+#   wt rm --merged [--dry-run]    remove every worktree that is safe to remove,
+#                                 after one confirmation (--yes to skip it)
+#   wt rm -i [--dry-run]          pick worktrees to remove in fzf (TAB marks,
+#                                 ENTER removes); the preview shows what each
+#                                 one would cost — unpushed commits and local
+#                                 changes — which is how you triage the ones
+#                                 --merged will not touch. Branches are still
+#                                 deleted safely, so an unmerged branch (and
+#                                 its commits) survives unless --force.
+#   wt mv <old> <new>             rename a worktree (moves it under WT_ROOT;
+#                                 renames its branch too when names match)
+#   wt cd [<name>] [options]      open + cd into it — needs the zsh wrapper:
+#                                 eval "$(wt init zsh)" in your zshrc
+#   wt init zsh                   print the zsh shell integration
+#
+# Options:
+#   -C <repo>        repo context (default: repo containing cwd)
+#   -b <base-ref>    base for a NEW branch (default: HEAD of the main worktree)
+#   --branch <name>  branch to create/check out (default: same as worktree name)
+#   --fresh          before opening: fetch the repo's default branch, fast-
+#                    forward it in the main worktree, and base a NEW branch on
+#                    origin/<default> so the worktree starts from fresh code
+#
+# "Safe to remove" (wt ls, wt rm --merged) means all three of: the branch is
+# fully merged into the default branch, no tracked file is modified, and no
+# untracked non-ignored file exists. wt-sync's payloads (.env, node_modules, …)
+# are gitignored so they never mask real work — but a stray scratch file does
+# keep a worktree off the list. Nothing here fetches, so merge state is only as
+# fresh as the last fetch; `wt ls` prints that age in its footer.
+#
+# Dependencies: git and coreutils only. `wt rm -i` additionally wants fzf — the
+# one optional dependency, needed by that flag alone; $WT_FZF overrides which
+# picker is used (it must accept fzf's --multi/--delimiter/--with-nth/--preview).
+#
+# `wt open` with an existing worktree of the same repo reuses it (sync only),
+# so it is safe to re-run; a directory owned by anything else is an error.
+# Name omitted -> generated as wt-<MMDD-HHMM>.
+
+set -euo pipefail
+
+WT_ROOT="${WT_ROOT:-$HOME/worktrees}"
+
+log() { printf '[wt] %s\n' "$*" >&2; }
+die() {
+  printf '[wt] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  # Print the header comment block: line 2 up to the first non-comment line,
+  # so the range never drifts as the header grows.
+  awk 'NR < 2 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
+  exit "${1:-0}"
+}
+
+script_dir=$(cd "$(dirname "$0")" && pwd)
+wt_sync() {
+  if [[ -x "$script_dir/wt-sync" ]]; then
+    "$script_dir/wt-sync" "$@"
+  elif command -v wt-sync >/dev/null 2>&1; then
+    wt-sync "$@"
+  else
+    log "wt-sync not found; skipping declarative sync"
+  fi
+}
+
+# Resolve the main worktree of the repo containing $1 (a directory).
+resolve_main() {
+  local ctx="$1" common
+  common=$(git -C "$ctx" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    die "not inside a git repo: $ctx (use -C <repo>)"
+  dirname "$common"
+}
+
+# Print the directories of this repo's linked worktrees whose folder name
+# matches $2 — covers worktrees living outside $WT_ROOT (legacy locations
+# like .claude/worktrees/<name>, editor-created ones, manual ones).
+find_worktrees_by_name() {
+  local main="$1" name="$2" line wt_path
+  git -C "$main" worktree list --porcelain | while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        wt_path="${line#worktree }"
+        if [[ "$wt_path" != "$main" && "$(basename "$wt_path")" == "$name" ]]; then
+          printf '%s\n' "$wt_path"
+        fi
+        ;;
+    esac
+  done
+}
+
+# Resolve a worktree name to its directory: the $WT_ROOT convention wins,
+# then any linked worktree with that folder name anywhere. Returns 1 when
+# nothing matches, 2 when the name is ambiguous outside $WT_ROOT (candidates
+# are printed to stderr). Runs inside $(…) subshells, so it must signal via
+# return codes — a die here would not stop the caller.
+resolve_worktree_dir() {
+  local main="$1" name="$2" preferred matches count
+  preferred="$WT_ROOT/$(basename "$main")/$name"
+  if [[ -d "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+  matches=$(find_worktrees_by_name "$main" "$name")
+  [[ -n "$matches" ]] || return 1
+  count=$(printf '%s\n' "$matches" | grep -c .)
+  if [[ "$count" -gt 1 ]]; then
+    printf '[wt] multiple worktrees named '\''%s'\'':\n%s\n' "$name" "$matches" >&2
+    return 2
+  fi
+  printf '%s\n' "$matches"
+}
+
+# ---- default branch / comparison base -------------------------------------
+
+# The repo's default branch name, without a remote prefix: origin/HEAD when the
+# remote advertises one, then a local master/main, then whatever the main
+# worktree has checked out.
+default_branch() {
+  local main="$1" ref
+  if ref=$(git -C "$main" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null); then
+    printf '%s\n' "${ref#origin/}"
+    return 0
+  fi
+  for ref in master main; do
+    if git -C "$main" show-ref --verify --quiet "refs/heads/$ref"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+  ref=$(git -C "$main" branch --show-current 2>/dev/null || true)
+  [[ -n "$ref" ]] || return 1
+  printf '%s\n' "$ref"
+}
+
+# The ref branches are compared against: whichever of the local default branch
+# and its remote-tracking counterpart is further ahead, so a branch merged
+# upstream is recognised even before the local branch is pulled.
+base_ref() {
+  local main="$1" def="$2"
+  if git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$def"; then
+    if ! git -C "$main" show-ref --verify --quiet "refs/heads/$def"; then
+      printf '%s\n' "origin/$def"
+      return 0
+    fi
+    if [[ "$(git -C "$main" rev-list --count "$def..origin/$def" 2>/dev/null || echo 0)" -gt 0 ]]; then
+      printf '%s\n' "origin/$def"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$def"
+}
+
+# Prelude shared by every awk program below, so the age format, the column
+# truncation, and above all the status wording have exactly one definition —
+# `wt ls`, the `rm --merged` list, and the `rm -i` picker must describe the same
+# worktree the same way.
+AWK_HELPERS='
+function rel_age(s) {
+  if (s < 3600)     return int(s / 60) "m"
+  if (s < 86400)    return int(s / 3600) "h"
+  if (s < 604800)   return int(s / 86400) "d"
+  if (s < 31536000) return int(s / 604800) "w"
+  return int(s / 31536000) "y"
+}
+function trunc(s, w) { return length(s) <= w ? s : substr(s, 1, w - 3) "..." }
+function status_of(flags, dirty, ahead, unpushed, ok,   s) {
+  if (flags ~ /(^|,)main(,|$)/)    return "(main worktree)"
+  if (flags ~ /(^|,)missing(,|$)/) return "gone from disk — git worktree prune"
+  if (flags ~ /(^|,)bare(,|$)/)    return "(bare)"
+  s = ""
+  if (dirty > 0)    s = "dirty " dirty
+  if (ahead > 0)    s = s (s ? ", " : "") "ahead " ahead
+  if (unpushed > 0) s = s (s ? ", " : "") "unpushed " unpushed
+  if (flags ~ /(^|,)detached(,|$)/) s = s (s ? ", " : "") "detached"
+  return s ? s : ok " safe to remove"
+}
+'
+
+# How stale the merge picture is: mtime of FETCH_HEAD, which git touches on
+# every fetch (including the ones `wt open --fresh` runs).
+fetch_age() {
+  local main="$1" f mtime now
+  f="$(git -C "$main" rev-parse --path-format=absolute --git-common-dir)/FETCH_HEAD"
+  if [[ ! -f "$f" ]]; then
+    printf 'never fetched\n'
+    return 0
+  fi
+  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || true)
+  if [[ -z "$mtime" ]]; then
+    printf 'fetch age unknown\n'
+    return 0
+  fi
+  now=$(date +%s)
+  awk -v s=$((now - mtime)) "$AWK_HELPERS"'BEGIN { printf "fetched %s ago\n", rel_age(s) }'
+}
+
+# ---- worktree inventory ----------------------------------------------------
+
+WT_TMP=""
+cleanup() {
+  [[ -z "$WT_TMP" ]] || rm -rf "$WT_TMP"
+  return 0
+}
+trap cleanup EXIT
+
+# One TAB-separated record per worktree of $1, newest commit first:
+#   ts  name  path  branch  dirty  ahead  unpushed  flags  age
+# flags is a comma-separated subset of: main, detached, bare, missing, safe.
+# Refs cannot contain control characters, so TAB is a safe separator.
+#
+# Costs three batched git calls for the whole repo plus one `git status` per
+# worktree, and those run in parallel (a 33-worktree repo goes from ~1.7s to
+# ~0.3s). Nothing fetches: "merged" is relative to base_ref as of the last
+# fetch.
+worktree_inventory() {
+  local main="$1" base="$2" tmp
+  WT_TMP=$(mktemp -d)
+  tmp="$WT_TMP"
+
+  git -C "$main" worktree list --porcelain |
+    awk '
+      /^worktree /{ p = substr($0, 10); b = ""; h = "" }
+      /^HEAD /    { h = substr($0, 6) }
+      /^branch /  { b = substr($0, 8); sub(/^refs\/heads\//, "", b) }
+      /^detached$/{ b = "(detached)" }
+      /^bare$/    { b = "(bare)" }
+      /^$/        { if (p != "") { print p "\t" b "\t" h; p = "" } }
+      END         { if (p != "") print p "\t" b "\t" h }
+    ' >"$tmp/worktrees"
+
+  # Everything about every branch in one call: commit date, upstream state, and
+  # how far it is ahead of the base. ahead == 0 IS the merged test — it holds
+  # for merge and rebase histories alike. %(ahead-behind:) needs git >= 2.41;
+  # older gits get the counts from the rev-list pass below instead.
+  : >"$tmp/aheads"
+  if ! git -C "$main" for-each-ref refs/heads \
+    --format='%(refname:short)%09%(committerdate:unix)%09%(upstream)%09%(upstream:track)%09%(ahead-behind:'"$base"')' \
+    >"$tmp/refs" 2>/dev/null; then
+    git -C "$main" for-each-ref refs/heads \
+      --format='%(refname:short)%09%(committerdate:unix)%09%(upstream)%09%(upstream:track)%09' \
+      >"$tmp/refs" 2>/dev/null || : >"$tmp/refs"
+    # Fallback: only branches that actually have a worktree are worth counting.
+    local wt_branch
+    while IFS=$'\t' read -r _ wt_branch _; do
+      case "$wt_branch" in
+        "" | "(detached)" | "(bare)") continue ;;
+      esac
+      printf '%s\t%s\n' "$wt_branch" \
+        "$(git -C "$main" rev-list --count "$base..$wt_branch" 2>/dev/null || echo 0)" \
+        >>"$tmp/aheads"
+    done <"$tmp/worktrees"
+  fi
+
+  # Detached worktrees have no ref to read metadata from; resolve those few by
+  # hand (usually none, so usually zero extra git calls).
+  local path branch head
+  : >"$tmp/detached"
+  while IFS=$'\t' read -r path branch head; do
+    [[ "$branch" == "(detached)" ]] || continue
+    printf '%s\t%s\t%s\n' "$head" \
+      "$(git -C "$main" show -s --format=%ct "$head" 2>/dev/null || echo 0)" \
+      "$(git -C "$main" rev-list --count "$base..$head" 2>/dev/null || echo 0)" \
+      >>"$tmp/detached"
+  done <"$tmp/worktrees"
+
+  # Per-worktree working-tree state, in parallel. The default --porcelain
+  # output counts modified tracked files AND untracked non-ignored files while
+  # excluding everything gitignored — exactly the "is there unsaved work here"
+  # question, and the reason wt-sync's payloads do not register.
+  local i=0 running=0
+  while IFS=$'\t' read -r path branch head; do
+    if [[ -d "$path" ]]; then
+      (git -C "$path" status --porcelain 2>/dev/null | grep -c . || true) >"$tmp/dirty.$i" &
+      running=$((running + 1))
+      if [[ "$running" -ge 32 ]]; then
+        wait
+        running=0
+      fi
+    else
+      printf '%s\n' "-1" >"$tmp/dirty.$i"
+    fi
+    i=$((i + 1))
+  done <"$tmp/worktrees"
+  wait
+
+  # Join the four inputs in one pass and emit the records, newest first.
+  awk -F'\t' "$AWK_HELPERS"'
+    FILENAME == refs     { rts[$1] = $2; rup[$1] = $3; rtrack[$1] = $4; rab[$1] = $5; next }
+    FILENAME == aheads   { aov[$1] = $2; next }
+    FILENAME == detached { dts[$1] = $2; dahead[$1] = $3; next }
+    {
+      path = $1; br = $2; head = $3
+      name = path; sub(/.*\//, "", name)
+      flags = ""; ts = 0; ahead = 0; unpushed = 0; up = ""; track = ""
+
+      if (br == "(detached)")            flags = "detached"
+      else if (br == "" || br == "(bare)") flags = "bare"
+      if (path == main) flags = flags (flags ? "," : "") "main"
+
+      dirty = 0
+      f = tmp "/dirty." n++
+      if ((getline dirty < f) <= 0) dirty = 0
+      close(f)
+      dirty = dirty + 0
+      if (dirty < 0) { dirty = 0; flags = flags (flags ? "," : "") "missing" }
+
+      if (br == "(detached)") {
+        ts = dts[head] + 0
+        ahead = dahead[head] + 0
+      } else if (flags !~ /(^|,)bare(,|$)/) {
+        ts = rts[br] + 0
+        up = rup[br]; track = rtrack[br]
+        if (br in aov)          ahead = aov[br] + 0
+        else if (rab[br] != "") { split(rab[br], ab, " "); ahead = ab[1] + 0 }
+      }
+
+      # Unpushed commits: what the upstream still lacks, or — with no usable
+      # upstream — every commit this branch adds on top of the base.
+      if (up != "" && track !~ /gone/) {
+        if (match(track, /ahead [0-9]+/))
+          unpushed = substr(track, RSTART + 6, RLENGTH - 6) + 0
+      } else {
+        unpushed = ahead
+      }
+
+      if (flags == "" && ahead == 0 && dirty == 0) flags = "safe"
+
+      printf "%d\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", \
+        ts, name, path, br, dirty, ahead, unpushed, \
+        (flags == "" ? "none" : flags), (ts > 0 ? rel_age(now - ts) : "-")
+    }
+  ' main="$main" now="$(date +%s)" tmp="$tmp" \
+    refs="$tmp/refs" aheads="$tmp/aheads" detached="$tmp/detached" \
+    "$tmp/refs" "$tmp/aheads" "$tmp/detached" "$tmp/worktrees" |
+    sort -rn -k1,1
+
+  rm -rf "$tmp"
+  WT_TMP=""
+}
+
+# Render the inventory of repo $1 as an aligned table. $3 = "safe" to keep only
+# removable rows. Padding is byte-based, so truncation stays ASCII and the only
+# multibyte glyphs live in the last column and the footer.
+render_table() {
+  local main="$1" base="$2" only_safe="${3:-}" color=0
+  [[ -t 1 ]] && color=1
+  worktree_inventory "$main" "$base" |
+    awk -F'\t' \
+      -v only_safe="$only_safe" -v color="$color" -v base="$base" \
+      -v fetched="$(fetch_age "$main")" -v ok="✓" "$AWK_HELPERS"'
+    {
+      safe = ($8 ~ /(^|,)safe(,|$)/)
+      if (safe) nsafe++
+      total++
+      if (only_safe && !safe) next
+      kept++
+      rows[kept] = $0
+      if (length($2) > wn) wn = length($2)
+      if (length($4) > wb) wb = length($4)
+    }
+    END {
+      if (total == 0) { print "no worktrees"; exit }
+      if (wn > 24) wn = 24
+      if (wb > 46) wb = 46
+      if (wn < 4)  wn = 4
+      if (wb < 6)  wb = 6
+      green = color ? "\033[32m" : ""
+      yellow = color ? "\033[33m" : ""
+      dim = color ? "\033[2m" : ""
+      off = color ? "\033[0m" : ""
+      if (kept == 0) {
+        printf "%snothing removable — all %d worktrees have local work%s\n", dim, total, off
+      } else {
+        printf "%s%-*s  %-*s  %4s  %s%s\n", dim, wn, "NAME", wb, "BRANCH", "AGE", "STATUS", off
+      }
+      for (r = 1; r <= kept; r++) {
+        split(rows[r], f, "\t")
+        st = status_of(f[8], f[5], f[6], f[7], ok)
+        if (f[8] ~ /(^|,)safe(,|$)/)             col = green
+        else if (f[8] ~ /(^|,)(main|bare)(,|$)/) col = dim
+        else                                     col = yellow
+        printf "%-*s  %-*s  %4s  %s%s%s\n", wn, trunc(f[2], wn), wb, trunc(f[4], wb), f[9], col, st, off
+      }
+      # Deliberately worded differently from the per-row status, so grepping
+      # the output for "safe to remove" only ever matches actual rows.
+      printf "\n%s%d worktrees · %d removable%s · base %s, %s%s\n", \
+        dim, total, nsafe, (only_safe ? "" : " (wt ls --safe)"), base, fetched, off
+    }
+  '
+}
+
+# ---- interactive removal ---------------------------------------------------
+
+# One picker row per worktree that could be removed — everything except the main
+# worktree, a bare one, and the one the caller is standing in. Deliberately
+# includes worktrees with local work: choosing those with the evidence in front
+# of you is the entire point of the picker, and what `rm --merged` cannot do.
+#
+# Each row is the padded display column followed by the metadata the caller
+# needs back, TAB-separated, so the picker shows field 1 and returns them all:
+#   display  path  dirty  unpushed  name  branch
+picker_rows() {
+  local main="$1" base="$2" cwd="$3"
+  worktree_inventory "$main" "$base" |
+    awk -F'\t' "$AWK_HELPERS"'
+      $8 ~ /(^|,)(main|bare)(,|$)/ { next }
+      $3 == cwd || index(cwd, $3 "/") == 1 { next }
+      {
+        rows[++n] = $0
+        if (length($2) > wn) wn = length($2)
+        if (length($4) > wb) wb = length($4)
+      }
+      END {
+        if (n == 0) exit
+        if (wn > 24) wn = 24
+        if (wb > 46) wb = 46
+        for (r = 1; r <= n; r++) {
+          split(rows[r], f, "\t")
+          printf "%-*s  %-*s  %4s  %s\t%s\t%d\t%d\t%s\t%s\n", \
+            wn, trunc(f[2], wn), wb, trunc(f[4], wb), f[9], \
+            status_of(f[8], f[5], f[6], f[7], ok), \
+            f[3], f[5], f[7], f[2], f[4]
+        }
+      }
+    ' cwd="$cwd" ok="✓"
+}
+
+# The fzf preview: what selecting this worktree would destroy. Runs per
+# highlighted row with {2} (the worktree path) substituted by the picker, so it
+# is a self-contained sh script with $base baked in.
+preview_cmd() {
+  local base="$1"
+  cat <<PREVIEW
+p={2}
+if [ ! -d "\$p" ]; then
+  echo "directory is gone — selecting this prunes the stale git entry"
+  exit 0
+fi
+printf '\033[1m%s\033[0m\n' "\$p"
+n=\$(git -C "\$p" rev-list --count '$base'..HEAD 2>/dev/null || echo 0)
+if [ "\$n" -gt 0 ]; then
+  printf '\n%s commit(s) not in $base:\n' "\$n"
+  git -C "\$p" log --oneline --max-count=10 '$base'..HEAD 2>/dev/null | sed 's/^/  /'
+else
+  printf '\nfully merged into $base\n'
+fi
+d=\$(git -C "\$p" status --porcelain 2>/dev/null | grep -c . || true)
+if [ "\$d" -gt 0 ]; then
+  printf '\n%s local change(s) — these are destroyed:\n' "\$d"
+  git -C "\$p" status --short 2>/dev/null | head -20 | sed 's/^/  /'
+else
+  printf '\nworking tree clean\n'
+fi
+PREVIEW
+}
+
+# ---- removal ---------------------------------------------------------------
+
+# Remove one worktree and, when it can, its branch. $4 forces the worktree
+# removal past local changes; $5 upgrades the branch delete from -d (merged
+# only) to -D. Returns non-zero when the worktree itself survived, leaving its
+# branch alone. A worktree whose directory is already gone is pruned instead.
+remove_worktree() {
+  local main="$1" dir="$2" br="$3" force_wt="$4" force_br="$5"
+  if [[ ! -d "$dir" ]]; then
+    git -C "$main" worktree prune >&2 || return 1
+    log "pruned stale entries (directory of $dir was already gone)"
+  elif $force_wt; then
+    git -C "$main" worktree remove --force "$dir" >&2 || return 1
+    log "removed $dir"
+  else
+    git -C "$main" worktree remove "$dir" >&2 || return 1
+    log "removed $dir"
+  fi
+  [[ -n "$br" && "$br" != "(detached)" ]] || return 0
+  if $force_br; then
+    if git -C "$main" branch -D "$br" >/dev/null 2>&1; then
+      log "deleted branch '$br'"
+    else
+      log "branch '$br' kept (checked out in another worktree?)"
+    fi
+  elif git -C "$main" branch -d "$br" >/dev/null 2>&1; then
+    log "deleted merged branch '$br'"
+  else
+    log "branch '$br' kept (unmerged); delete with: git -C \"$main\" branch -D \"$br\""
+  fi
+}
+
+# ---- argument parsing ------------------------------------------------------
+
+cmd=""
+name=""
+ctx="$PWD"
+base=""
+branch=""
+force=false
+list_all=false
+only_safe=""
+rm_merged=false
+interactive=false
+dry_run=false
+assume_yes=false
+fresh=false
+pos1=""
+pos2=""
+pos3=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -C)
+      ctx="${2:?-C requires a path}"
+      shift 2
+      ;;
+    -b)
+      base="${2:?-b requires a ref}"
+      shift 2
+      ;;
+    --branch)
+      branch="${2:?--branch requires a name}"
+      shift 2
+      ;;
+    --force) force=true; shift ;;
+    --all) list_all=true; shift ;;
+    --safe) only_safe=safe; shift ;;
+    --merged) rm_merged=true; shift ;;
+    --interactive | -i) interactive=true; shift ;;
+    --dry-run | -n) dry_run=true; shift ;;
+    --yes | -y) assume_yes=true; shift ;;
+    --fresh) fresh=true; shift ;;
+    --help | -h) usage ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *)
+      if [[ -z "$pos1" ]]; then
+        pos1="$1"
+      elif [[ -z "$pos2" ]]; then
+        pos2="$1"
+      elif [[ -z "$pos3" ]]; then
+        pos3="$1"
+      else
+        die "too many arguments: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Strict dispatch: the first positional must be a subcommand — there is no
+# default command. Later positionals are always data, so `wt open ls` happily
+# opens a worktree named "ls".
+new_name=""
+case "$pos1" in
+  open | sync | ls | path | rm | init)
+    cmd="$pos1"
+    name="$pos2"
+    [[ -z "$pos3" ]] || die "too many arguments: $pos3"
+    ;;
+  cd)
+    # cd can't work from a child process — only the zsh wrapper can move
+    # the calling shell.
+    die 'wt cd needs the shell wrapper; add to your zshrc:  eval "$(wt init zsh)"'
+    ;;
+  mv)
+    cmd="mv"
+    name="$pos2"
+    new_name="$pos3"
+    ;;
+  "")
+    usage 1
+    ;;
+  *)
+    die "unknown command: '$pos1' — to open a worktree with that name: wt open $pos1"
+    ;;
+esac
+
+# Flags belong to specific subcommands; a silent no-op would be worse than a
+# refusal (e.g. `wt rm foo --safe` looking like it checked anything).
+[[ -z "$only_safe" || "$cmd" == "ls" ]] || die "--safe only applies to: wt ls"
+! $rm_merged || [[ "$cmd" == "rm" ]] || die "--merged only applies to: wt rm"
+! $interactive || [[ "$cmd" == "rm" ]] || die "-i only applies to: wt rm"
+! $interactive || ! $rm_merged || die "-i and --merged both pick what to remove; use one"
+! $dry_run || [[ "$cmd" == "rm" ]] || die "--dry-run only applies to: wt rm --merged"
+! $assume_yes || [[ "$cmd" == "rm" ]] || die "--yes only applies to: wt rm --merged"
+! $fresh || [[ "$cmd" == "open" ]] || die "--fresh only applies to: wt open (and wt cd)"
+! $fresh || [[ -z "$base" ]] || die "-b and --fresh both pick a base; use one"
+
+# ---- subcommands -----------------------------------------------------------
+
+case "$cmd" in
+  sync)
+    wt_sync --to "${name:-$PWD}"
+    exit 0
+    ;;
+
+  init)
+    [[ "$name" == "zsh" ]] || die "usage: wt init zsh"
+    # stdout below is meant for: eval "$(wt init zsh)"
+    cat <<'EOF'
+# wt shell integration: `wt cd [<name>] [open options]` opens a worktree
+# (creating it if needed, syncing either way) and cd's into it; every other
+# subcommand passes through to the wt executable untouched.
+wt() {
+  if [[ "${1:-}" == "cd" ]]; then
+    shift
+    local dir
+    dir="$(command wt open "$@")" || return
+    cd "$dir"
+  else
+    command wt "$@"
+  fi
+}
+EOF
+    exit 0
+    ;;
+
+  ls)
+    [[ -z "$name" ]] || die "wt ls takes no name (did you mean: wt path $name)"
+    if $list_all; then
+      [[ -d "$WT_ROOT" ]] || die "no worktrees yet under $WT_ROOT"
+      first=true
+      # One section per repo under WT_ROOT, keyed off any one of its worktrees.
+      for repo_dir in "$WT_ROOT"/*/; do
+        [[ -d "$repo_dir" ]] || continue
+        # Keep probing: a stale non-worktree directory (leftover from a manual
+        # rm, say) must not hide the rest of the repo's worktrees.
+        repo_main=""
+        for cand in "$repo_dir"*/; do
+          [[ -d "$cand" ]] || continue
+          repo_main=$(resolve_main "$cand" 2>/dev/null) && break
+          repo_main=""
+        done
+        if [[ -z "$repo_main" ]]; then
+          log "skipping $(basename "$repo_dir"): no git worktree under it"
+          continue
+        fi
+        $first || printf '\n'
+        first=false
+        printf '== %s (%s)\n' "$(basename "$repo_main")" "$repo_main"
+        repo_def=$(default_branch "$repo_main") ||
+          die "cannot determine the default branch of $repo_main"
+        render_table "$repo_main" "$(base_ref "$repo_main" "$repo_def")" "$only_safe"
+      done
+    else
+      main=$(resolve_main "$ctx")
+      def=$(default_branch "$main") || die "cannot determine the default branch of $main"
+      render_table "$main" "$(base_ref "$main" "$def")" "$only_safe"
+    fi
+    exit 0
+    ;;
+
+  path)
+    [[ -n "$name" ]] || die "usage: wt path <name>"
+    main=$(resolve_main "$ctx")
+    dir=$(resolve_worktree_dir "$main" "$name") || {
+      rc=$?
+      [[ "$rc" -eq 2 ]] && die "worktree name '$name' is ambiguous (candidates above)"
+      die "no worktree named '$name' in $(basename "$main") (see: wt ls)"
+    }
+    printf '%s\n' "$dir"
+    exit 0
+    ;;
+
+  rm)
+    if $interactive; then
+      [[ -z "$name" ]] || die "wt rm -i takes no name (drop '$name' or drop -i)"
+      main=$(resolve_main "$ctx")
+      def=$(default_branch "$main") || die "cannot determine the default branch of $main"
+      base=$(base_ref "$main" "$def")
+      picker="${WT_FZF:-fzf}"
+      command -v "$picker" >/dev/null 2>&1 ||
+        die "wt rm -i needs '$picker' in PATH (brew install fzf), or set WT_FZF to another
+       picker; without one: wt ls --safe, then wt rm <name>"
+
+      rows=()
+      while IFS= read -r line; do rows+=("$line"); done < <(picker_rows "$main" "$base" "$(pwd -P)")
+      if [[ "${#rows[@]}" -eq 0 ]]; then
+        log "nothing to pick: $(basename "$main") has no removable worktree here"
+        exit 0
+      fi
+
+      # TAB-selected lines come back whole, so every field is still available.
+      selection=$(
+        printf '%s\n' "${rows[@]}" |
+          "$picker" --multi --delimiter $'\t' --with-nth 1 \
+            --prompt 'remove > ' --marker '▌' --pointer '>' \
+            --header "TAB to mark, ENTER to remove, ESC to cancel
+$(printf '%-24s  %-46s  %4s  %s' NAME BRANCH AGE STATUS)" \
+            --preview "$(preview_cmd "$base")" --preview-window 'down,14,wrap'
+      ) || true
+      if [[ -z "$selection" ]]; then
+        log "nothing selected; nothing removed"
+        exit 0
+      fi
+
+      sel_paths=()
+      sel_names=()
+      sel_branches=()
+      sel_lines=()
+      risky=0
+      while IFS=$'\t' read -r _ path dirty unpushed nm br; do
+        [[ -n "$path" ]] || continue
+        sel_paths+=("$path")
+        sel_names+=("$nm")
+        sel_branches+=("$br")
+        risk=""
+        [[ "$unpushed" -eq 0 ]] || risk="$unpushed unpushed commit(s) (branch is kept)"
+        [[ "$dirty" -eq 0 ]] || risk="${risk:+$risk, }$dirty local change(s) DESTROYED"
+        [[ -z "$risk" ]] || risky=$((risky + 1))
+        sel_lines+=("$(printf '  %-24s %s' "$nm" "${risk:-nothing at risk — merged and clean}")")
+      done <<<"$selection"
+
+      printf 'Removing %d worktree(s):\n' "${#sel_paths[@]}" >&2
+      printf '%s\n' "${sel_lines[@]}" >&2
+      if $dry_run; then
+        log "dry run: nothing removed"
+        exit 0
+      fi
+      # Only stop to ask when something is actually at stake: a selection of
+      # merged, clean worktrees costs nothing to remove, and the picker was
+      # already a deliberate choice.
+      if [[ "$risky" -gt 0 ]] && ! $assume_yes; then
+        printf 'Proceed? [y/N] ' >&2
+        reply=""
+        [[ -r /dev/tty ]] || die "no tty for the confirmation prompt; re-run with --yes"
+        IFS= read -r reply </dev/tty || true
+        case "$reply" in
+          y | Y | yes | YES) ;;
+          *)
+            log "aborted; nothing removed"
+            exit 0
+            ;;
+        esac
+      fi
+      removed=0
+      for idx in "${!sel_paths[@]}"; do
+        # Forcing the worktree is the point of picking it; the branch delete
+        # stays safe unless --force, so an unmerged branch survives and its
+        # commits stay recoverable.
+        if remove_worktree "$main" "${sel_paths[$idx]}" "${sel_branches[$idx]}" true "$force"; then
+          removed=$((removed + 1))
+        else
+          log "FAILED to remove ${sel_paths[$idx]}; keeping its branch"
+        fi
+      done
+      log "done: $removed of ${#sel_paths[@]} removed"
+      [[ "$removed" -eq "${#sel_paths[@]}" ]] || exit 1
+      exit 0
+    fi
+    if $rm_merged; then
+      [[ -z "$name" ]] || die "wt rm --merged takes no name (drop '$name' or drop --merged)"
+      main=$(resolve_main "$ctx")
+      def=$(default_branch "$main") || die "cannot determine the default branch of $main"
+      base=$(base_ref "$main" "$def")
+      cwd_real=$(pwd -P)
+      # Collect first, act second: the removals invalidate the inventory.
+      cand_names=()
+      cand_paths=()
+      cand_branches=()
+      cand_lines=()
+      while IFS=$'\t' read -r ts nm path br dirty ahead unpushed flags age; do
+        [[ ",$flags," == *",safe,"* ]] || continue
+        if [[ "$cwd_real" == "$path" || "$cwd_real" == "$path"/* ]]; then
+          log "keeping '$nm': you are standing in it"
+          continue
+        fi
+        cand_names+=("$nm")
+        cand_paths+=("$path")
+        cand_branches+=("$br")
+        # Same 46-column cap as the table, so the confirmation list stays
+        # aligned; the untruncated name above is what gets deleted.
+        br_disp="$br"
+        [[ "${#br_disp}" -le 46 ]] || br_disp="${br_disp:0:43}..."
+        cand_lines+=("$(printf '  %-24s %-46s %s' "$nm" "$br_disp" "$age")")
+      done < <(worktree_inventory "$main" "$base")
+
+      if [[ "${#cand_names[@]}" -eq 0 ]]; then
+        log "nothing to remove: no merged, clean worktrees in $(basename "$main")"
+        exit 0
+      fi
+      printf 'These %d worktrees are fully merged into %s and have no local work:\n' \
+        "${#cand_names[@]}" "$base" >&2
+      printf '%s\n' "${cand_lines[@]}" >&2
+      if $dry_run; then
+        log "dry run: nothing removed"
+        exit 0
+      fi
+      if ! $assume_yes; then
+        printf 'Remove all %d (worktrees + branches)? [y/N] ' "${#cand_names[@]}" >&2
+        reply=""
+        [[ -r /dev/tty ]] || die "no tty for the confirmation prompt; re-run with --yes"
+        IFS= read -r reply </dev/tty || true
+        case "$reply" in
+          y | Y | yes | YES) ;;
+          *)
+            log "aborted; nothing removed"
+            exit 0
+            ;;
+        esac
+      fi
+      removed=0
+      for idx in "${!cand_names[@]}"; do
+        # Forcing is required because wt-sync's gitignored payloads make every
+        # managed worktree dirty to git; the safety check above already proved
+        # there is no tracked change and no untracked non-ignored file here.
+        if remove_worktree "$main" "${cand_paths[$idx]}" "${cand_branches[$idx]}" true false; then
+          removed=$((removed + 1))
+        else
+          log "FAILED to remove ${cand_paths[$idx]}; keeping its branch"
+        fi
+      done
+      log "done: $removed of ${#cand_names[@]} removed"
+      exit 0
+    fi
+    [[ -n "$name" ]] || die "usage: wt rm <name> [--force] | wt rm --merged"
+    main=$(resolve_main "$ctx")
+    dir=$(resolve_worktree_dir "$main" "$name") || {
+      rc=$?
+      [[ "$rc" -eq 2 ]] && die "worktree name '$name' is ambiguous (candidates above)"
+      die "no worktree named '$name' in $(basename "$main") (see: wt ls)"
+    }
+    # Capture the branch before removal; --branch may differ from the name,
+    # and a detached HEAD yields "" (then there is no branch to delete).
+    br=$(git -C "$dir" branch --show-current 2>/dev/null || true)
+    # Without --force this keeps git's own refusal on local changes: wt-sync's
+    # synced files make every managed worktree "dirty", so the hint matters.
+    remove_worktree "$main" "$dir" "$br" "$force" "$force" ||
+      die "worktree has local/untracked changes; re-run as: wt rm $name --force"
+    exit 0
+    ;;
+
+  mv)
+    [[ -n "$name" && -n "$new_name" ]] || die "usage: wt mv <old> <new>"
+    [[ "$new_name" =~ ^[A-Za-z0-9._-]+$ ]] ||
+      die "worktree name must match [A-Za-z0-9._-]+: '$new_name'"
+    [[ "$new_name" != "." && "$new_name" != ".." ]] ||
+      die "invalid worktree name: '$new_name'"
+    [[ "$name" != "$new_name" ]] ||
+      die "old and new names are identical: '$name'"
+    main=$(resolve_main "$ctx")
+    repo=$(basename "$main")
+    src=$(resolve_worktree_dir "$main" "$name") || {
+      rc=$?
+      [[ "$rc" -eq 2 ]] && die "worktree name '$name' is ambiguous (candidates above)"
+      die "no worktree named '$name' in $repo (see: wt ls)"
+    }
+    dst="$WT_ROOT/$repo/$new_name"
+    # Validate what we can BEFORE moving; if the branch rename still fails
+    # after the move (e.g. a ref D/F conflict like an existing '<new>/sub'
+    # branch), it degrades to "worktree renamed, branch kept" below.
+    if resolve_worktree_dir "$main" "$new_name" >/dev/null; then
+      die "worktree '$new_name' already exists (see: wt ls)"
+    elif [[ $? -eq 2 ]]; then
+      die "worktree name '$new_name' is ambiguous (candidates above)"
+    fi
+    [[ -e "$dst" ]] && die "$dst already exists; refusing to overwrite"
+    # The branch follows the worktree only when it tracks the old name —
+    # the same name<->branch coupling as wt rm.
+    br=$(git -C "$src" branch --show-current 2>/dev/null || true)
+    if [[ "$br" == "$name" ]] &&
+      git -C "$main" show-ref --verify --quiet "refs/heads/$new_name"; then
+      die "branch '$new_name' already exists; pick another name"
+    fi
+    mkdir -p "$WT_ROOT/$repo"
+    # git worktree move may chat on stdout; keep stdout = bare new path.
+    git -C "$main" worktree move "$src" "$dst" 1>&2
+    log "moved worktree '$name' -> $dst"
+    if [[ "$br" == "$name" ]]; then
+      if git -C "$main" branch -m "$name" "$new_name" >&2; then
+        log "renamed branch '$name' -> '$new_name'"
+      else
+        log "worktree moved, but branch '$name' kept (rename to '$new_name' failed; see above)"
+      fi
+    elif [[ -n "$br" ]]; then
+      log "branch '$br' kept (differs from worktree name)"
+    fi
+    printf '%s\n' "$dst"
+    exit 0
+    ;;
+
+  open) ;; # falls through to create-or-reuse below
+
+  *) die "unknown command: $cmd" ;;
+esac
+
+# ---- create or reuse -------------------------------------------------------
+
+main=$(resolve_main "$ctx")
+repo=$(basename "$main")
+
+if [[ -z "$name" ]]; then
+  name="wt-$(date +%m%d-%H%M)"
+  log "no name given; using generated name '$name'"
+fi
+[[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] ||
+  die "worktree name must match [A-Za-z0-9._-]+ (branch names go in --branch): '$name'"
+[[ "$name" != "." && "$name" != ".." ]] ||
+  die "invalid worktree name: '$name'"
+
+branch="${branch:-$name}"
+
+# --fresh: make the default branch current before anything is created, so a new
+# branch starts from freshly fetched code and an existing worktree at least gets
+# an up-to-date origin/<default> to rebase onto. Runs before the reuse check on
+# purpose — reusing a worktree should still refresh the repo.
+fresh_base=""
+if $fresh; then
+  def=$(default_branch "$main") || die "cannot determine the default branch of $main"
+  if git -C "$main" fetch --quiet origin "$def" >&2; then
+    log "fetched origin/$def"
+  else
+    log "fetch of origin/$def failed; continuing with local state"
+  fi
+  cur=$(git -C "$main" branch --show-current 2>/dev/null || true)
+  if [[ "$cur" == "$def" ]]; then
+    if git -C "$main" merge --ff-only "origin/$def" >/dev/null 2>&1; then
+      log "fast-forwarded $def in $main"
+    else
+      log "could not fast-forward $def in $main (dirty or diverged); left as is"
+    fi
+  elif git -C "$main" fetch --quiet origin "$def:$def" >/dev/null 2>&1; then
+    log "fast-forwarded local $def"
+  else
+    log "local $def not updated (checked out elsewhere or diverged)"
+  fi
+  # Base new branches on the remote ref regardless of whether the local
+  # fast-forward worked, so a dirty main worktree never yields stale code.
+  if git -C "$main" show-ref --verify --quiet "refs/remotes/origin/$def"; then
+    fresh_base="origin/$def"
+  fi
+fi
+
+# Reuse an existing worktree wherever it lives — $WT_ROOT convention first,
+# then legacy/editor locations found via `git worktree list`.
+if dir=$(resolve_worktree_dir "$main" "$name"); then
+  owner=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  [[ "$owner" == "$main/.git" ]] ||
+    die "$dir exists but is not a worktree of $main; refusing to touch it"
+  log "reusing existing worktree '$name' at $dir ($(git -C "$dir" branch --show-current))"
+elif [[ $? -eq 2 ]]; then
+  # $? still holds resolve_worktree_dir's status from the failed condition.
+  die "worktree name '$name' is ambiguous (candidates above)"
+else
+  dir="$WT_ROOT/$repo/$name"
+  mkdir -p "$WT_ROOT/$repo"
+  # git worktree add chats on stdout ("HEAD is now at …"); route it to stderr
+  # so wt's stdout stays the bare worktree path.
+  if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+    [[ -z "$base" ]] || die "branch '$branch' already exists; -b <base> only applies to new branches"
+    git -C "$main" worktree add "$dir" "$branch" 1>&2
+  else
+    # --no-track: branching off a remote-tracking ref would otherwise set the
+    # new branch's upstream to origin/<default>, which makes a later plain
+    # `git push` refuse (push.default=simple wants matching names). The branch
+    # gets its real upstream from the first `git push -u`.
+    git -C "$main" worktree add --no-track -b "$branch" "$dir" \
+      "${base:-${fresh_base:-HEAD}}" 1>&2
+  fi
+  log "created worktree '$name' on branch '$branch'${fresh_base:+ (based on $fresh_base)}"
+fi
+
+wt_sync --to "$dir" --from "$main"
+printf '%s\n' "$dir"
