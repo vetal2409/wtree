@@ -31,12 +31,15 @@
 # silently so it can be wired unconditionally into hooks.
 #
 # Usage:
-#   wt-sync [<target-worktree>] [--to <path>] [--from <path>] [--dry-run] [--quiet]
+#   wt-sync [<target-worktree>] [--to <path>] [--from <path>] [--dry-run] [--quiet] [--version]
 #
 #   --to    target worktree to populate   (default: worktree containing cwd)
 #   --from  source worktree to read from  (default: the repo's main worktree)
+#   --version  print the version and exit
 
 set -euo pipefail
+
+WT_VERSION="0.1.0"
 
 QUIET=false
 DRY_RUN=false
@@ -53,7 +56,7 @@ die() {
 usage() {
   # Range spans the header comment block (line 2 .. the last '#' doc line);
   # bump the end line when the header grows so -h stays complete.
-  sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -74,6 +77,10 @@ while [[ $# -gt 0 ]]; do
     --quiet | -q)
       QUIET=true
       shift
+      ;;
+    --version | -V)
+      printf 'wt-sync %s\n' "$WT_VERSION"
+      exit 0
       ;;
     --help | -h) usage ;;
     -*) die "unknown option: $1 (see --help)" ;;

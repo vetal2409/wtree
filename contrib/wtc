@@ -15,6 +15,7 @@
 #   wtc --no-fresh [<name>]         skip the fetch + fast-forward of the
 #                                   default branch (passes plain `wt open`)
 #   wtc init zsh                    print the zsh shell integration
+#   wtc --version                 print the version
 #
 # By default the new branch starts from a freshly fetched origin/<default>.
 # `-b <ref>` overrides that base without giving up the fetch, and `-b .` bases
@@ -47,6 +48,8 @@
 # stdout is the worktree path, same contract as wt.
 
 set -euo pipefail
+
+WT_VERSION="0.1.0"
 
 log() { printf '[wtc] %s\n' "$*" >&2; }
 die() {
@@ -90,7 +93,7 @@ case "${1:-}" in
 # cd's there, and starts $WTC_START_CMD. --no-start skips that last step.
 wtc() {
   case "${1:-}" in
-    init | -h | --help)
+    init | -h | --help | -V | --version)
       command wtc "$@"
       return
       ;;
@@ -110,6 +113,10 @@ wtc() {
   eval "${WTC_START_CMD:-claude --permission-mode auto}"
 }
 EOF
+    exit 0
+    ;;
+  -V | --version)
+    printf 'wtc %s\n' "$WT_VERSION"
     exit 0
     ;;
   -h | --help) usage ;;

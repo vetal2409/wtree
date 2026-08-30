@@ -268,6 +268,13 @@ assert_eq "$(git -C "$WT_ROOT/main/detached-base" rev-parse HEAD)" "$det" \
 assert_eq "$(git -C "$WT_ROOT/main/from-ctx" rev-parse HEAD)" \
   "$(git -C "$main" rev-parse HEAD)" "-b . resolves against -C, not the cwd"
 
+# --- version -----------------------------------------------------------------
+out=$("$WT" --version)
+assert_eq "$out" "wt 0.1.0" "wt --version prints name and version"
+out=$("$WT" -V)
+assert_eq "$out" "wt 0.1.0" "wt -V is the same as --version"
+assert_match "$("$WT" -h)" "--version" "wt -h documents --version"
+
 # ---- summary ------------------------------------------------------------
 if [[ "$fails" -eq 0 ]]; then
   echo "all tests passed"

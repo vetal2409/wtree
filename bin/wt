@@ -37,6 +37,7 @@
 #   wt cd [<name>] [options]      open + cd into it — needs the zsh wrapper:
 #                                 eval "$(wt init zsh)" in your zshrc
 #   wt init zsh                   print the zsh shell integration
+#   wt --version                  print the version
 #
 # Options:
 #   -C <repo>        repo context (default: repo containing cwd)
@@ -66,6 +67,8 @@
 # Name omitted -> generated as wt-<MMDD-HHMM>.
 
 set -euo pipefail
+
+WT_VERSION="0.1.0"
 
 WT_ROOT="${WT_ROOT:-$HOME/worktrees}"
 
@@ -557,6 +560,10 @@ while [[ $# -gt 0 ]]; do
     --dry-run | -n) dry_run=true; shift ;;
     --yes | -y) assume_yes=true; shift ;;
     --fresh) fresh=true; shift ;;
+    --version | -V)
+      printf 'wt %s\n' "$WT_VERSION"
+      exit 0
+      ;;
     --help | -h) usage ;;
     -*) die "unknown option: $1 (see --help)" ;;
     *)
