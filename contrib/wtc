@@ -16,6 +16,15 @@
 #                                   default branch (passes plain `wt open`)
 #   wtc init zsh                    print the zsh shell integration
 #
+# By default the new branch starts from a freshly fetched origin/<default>.
+# `-b <ref>` overrides that base without giving up the fetch, and `-b .` bases
+# it on whatever the current directory is on — so `--no-fresh` is only for
+# staying off the network:
+#   wtc spike              fetch, branch off origin/<default>
+#   wtc spike -b .         fetch, branch off the branch you are standing on
+#   wtc spike -b abc123    fetch, branch off that commit
+#   wtc --no-fresh spike   no fetch, branch off the main worktree's HEAD
+#
 # `cd` cannot cross a process boundary, so the real entry point is the zsh
 # function; add to your zshrc:  eval "$(wtc init zsh)"
 #

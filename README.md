@@ -49,9 +49,9 @@ eval "$(wt init zsh)"     # optional: adds `wt cd`
 Options:
 
 - `-C <repo>` — repo context (default: repo containing cwd)
-- `-b <base-ref>` — base for a NEW branch (default: HEAD of the main worktree)
+- `-b <base-ref>` — base for a NEW branch (default: HEAD of the main worktree, or `origin/<default>` under `--fresh`). `-b .` means whatever the repo context is on right now: the branch checked out there, or its commit when HEAD is detached
 - `--branch <name>` — branch to create/check out (default: same as worktree name)
-- `--fresh` — before opening: fetch the repo's default branch, fast-forward it in the main worktree, and base a NEW branch on `origin/<default>` so the worktree starts from fresh code
+- `--fresh` — before opening: fetch the repo's default branch and fast-forward it in the main worktree, so the worktree starts from fresh code. A NEW branch is based on `origin/<default>` unless `-b` picks something else — the two compose, so `wt open --fresh -b . spike` refreshes the repo and still branches off where you are standing
 
 ## The output contract
 

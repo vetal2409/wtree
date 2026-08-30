@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Tests for wt's safety classification (wt ls / wt rm --merged) and for
-# `wt open --fresh`. Dependency-free (bash + git + coreutils): builds a throwaway
-# origin + clone + worktrees, then asserts on wt's own output.
+# Tests for wt's safety classification (wt ls / wt rm --merged) and for base
+# selection on `wt open` (--fresh, -b <ref>, -b .). Dependency-free (bash + git
+# + coreutils): builds a throwaway origin + clone + worktrees, then asserts on
+# wt's own output.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -132,9 +133,10 @@ set -e
 assert_match "$err" 'takes no name' "refusal explains the conflict"
 
 set +e
-err=$(wt open --fresh -b master conflict 2>&1); rc=$?
+err=$(wt ls -b master 2>&1); rc=$?
 set -e
-[[ $rc -ne 0 ]] && pass "--fresh with -b is refused" || fail "--fresh -b accepted (rc=$rc)"
+[[ $rc -ne 0 ]] && pass "-b on a non-open subcommand is refused" ||
+  fail "wt ls -b silently ignored the flag"
 
 set +e
 err=$(wt ls --fresh 2>&1); rc=$?
@@ -226,6 +228,45 @@ err=$(WT_FZF=wt-no-such-picker wt rm -i 2>&1); rc=$?
 set -e
 [[ $rc -ne 0 ]] && pass "a missing picker is a clear error" || fail "missing picker was ignored"
 assert_match "$err" 'WT_FZF' "the error names the WT_FZF escape hatch"
+
+# ---- base selection ------------------------------------------------------
+# --fresh and -b are orthogonal: --fresh refreshes the repo from origin, -b
+# picks what the new branch starts from. Both together must do both.
+first=$(git -C "$main" rev-parse master^)
+out=$(wt open --fresh -b "$first" pinned 2>&1)
+assert_dir "$WT_ROOT/main/pinned" "--fresh with -b creates the worktree"
+assert_match "$out" 'fetched origin/master' "--fresh still fetches when -b is given"
+assert_eq "$(git -C "$WT_ROOT/main/pinned" rev-parse HEAD)" "$first" \
+  "-b wins over --fresh's origin/<default> when both are given"
+assert_match "$out" "based on $first" "the log names the base actually used"
+[[ ! -f "$WT_ROOT/main/pinned/new.txt" ]] &&
+  pass "-b pinned the branch behind the fetched upstream commit" ||
+  fail "-b was ignored in favour of origin/master"
+
+# -b . means "whatever the repo context is on right now".
+git -C "$WT_ROOT/main/pinned" config user.email test@example.com
+git -C "$WT_ROOT/main/pinned" config user.name test
+printf 'sidework\n' >"$WT_ROOT/main/pinned/side.txt"
+git -C "$WT_ROOT/main/pinned" add side.txt
+git -C "$WT_ROOT/main/pinned" commit -qm side
+tip=$(git -C "$WT_ROOT/main/pinned" rev-parse HEAD)
+
+out=$(cd "$WT_ROOT/main/pinned" && "$WT" open -b . stacked 2>&1)
+assert_eq "$(git -C "$WT_ROOT/main/stacked" rev-parse HEAD)" "$tip" \
+  "-b . bases the new branch on the current worktree's tip"
+assert_match "$out" 'based on pinned' "-b . resolves to the branch name when attached"
+
+# Detached HEAD has no branch name to borrow, so it falls back to the commit.
+git -C "$WT_ROOT/main/pinned" checkout -q --detach
+det=$(git -C "$WT_ROOT/main/pinned" rev-parse HEAD)
+(cd "$WT_ROOT/main/pinned" && "$WT" open -b . detached-base >/dev/null 2>&1)
+assert_eq "$(git -C "$WT_ROOT/main/detached-base" rev-parse HEAD)" "$det" \
+  "-b . falls back to the SHA on a detached HEAD"
+
+# -b . follows the repo context, not the shell: -C wins.
+(cd "$WT_ROOT/main/dirty" && "$WT" -C "$main" open -b . from-ctx >/dev/null 2>&1)
+assert_eq "$(git -C "$WT_ROOT/main/from-ctx" rev-parse HEAD)" \
+  "$(git -C "$main" rev-parse HEAD)" "-b . resolves against -C, not the cwd"
 
 # ---- summary ------------------------------------------------------------
 if [[ "$fails" -eq 0 ]]; then

@@ -40,11 +40,15 @@
 #
 # Options:
 #   -C <repo>        repo context (default: repo containing cwd)
-#   -b <base-ref>    base for a NEW branch (default: HEAD of the main worktree)
+#   -b <base-ref>    base for a NEW branch (default: HEAD of the main worktree,
+#                    or origin/<default> under --fresh). `-b .` means whatever
+#                    the repo context is on right now: the branch checked out
+#                    there, or its commit when HEAD is detached.
 #   --branch <name>  branch to create/check out (default: same as worktree name)
-#   --fresh          before opening: fetch the repo's default branch, fast-
-#                    forward it in the main worktree, and base a NEW branch on
-#                    origin/<default> so the worktree starts from fresh code
+#   --fresh          before opening: fetch the repo's default branch and fast-
+#                    forward it in the main worktree, so the worktree starts
+#                    from fresh code. A NEW branch is based on origin/<default>
+#                    unless -b picks something else — the two compose.
 #
 # "Safe to remove" (wt ls, wt rm --merged) means all three of: the branch is
 # fully merged into the default branch, no tracked file is modified, and no
@@ -607,7 +611,7 @@ esac
 ! $dry_run || [[ "$cmd" == "rm" ]] || die "--dry-run only applies to: wt rm --merged"
 ! $assume_yes || [[ "$cmd" == "rm" ]] || die "--yes only applies to: wt rm --merged"
 ! $fresh || [[ "$cmd" == "open" ]] || die "--fresh only applies to: wt open (and wt cd)"
-! $fresh || [[ -z "$base" ]] || die "-b and --fresh both pick a base; use one"
+[[ -z "$base" ]] || [[ "$cmd" == "open" ]] || die "-b only applies to: wt open (and wt cd)"
 
 # ---- subcommands -----------------------------------------------------------
 
@@ -912,6 +916,16 @@ esac
 main=$(resolve_main "$ctx")
 repo=$(basename "$main")
 
+# `-b .` starts the new branch from wherever the repo context already is. Prefer
+# the branch name — refs/heads/* is shared between worktrees, so it resolves
+# identically from the main worktree, and it reads better in the log — and fall
+# back to the commit when HEAD is detached and there is no name to borrow.
+if [[ "$base" == "." ]]; then
+  base=$(git -C "$ctx" symbolic-ref --quiet --short HEAD 2>/dev/null) ||
+    base=$(git -C "$ctx" rev-parse HEAD 2>/dev/null) ||
+    die "-b . : cannot resolve HEAD in $ctx"
+fi
+
 if [[ -z "$name" ]]; then
   name="wt-$(date +%m%d-%H%M)"
   log "no name given; using generated name '$name'"
@@ -969,6 +983,11 @@ else
   mkdir -p "$WT_ROOT/$repo"
   # git worktree add chats on stdout ("HEAD is now at …"); route it to stderr
   # so wt's stdout stays the bare worktree path.
+  # An explicit -b wins over --fresh's origin/<default>: --fresh refreshes the
+  # repo, -b decides where the branch starts. With neither, a new branch starts
+  # from whatever the main worktree has checked out.
+  new_base="${base:-${fresh_base:-HEAD}}"
+  based=""
   if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
     [[ -z "$base" ]] || die "branch '$branch' already exists; -b <base> only applies to new branches"
     git -C "$main" worktree add "$dir" "$branch" 1>&2
@@ -977,10 +996,10 @@ else
     # new branch's upstream to origin/<default>, which makes a later plain
     # `git push` refuse (push.default=simple wants matching names). The branch
     # gets its real upstream from the first `git push -u`.
-    git -C "$main" worktree add --no-track -b "$branch" "$dir" \
-      "${base:-${fresh_base:-HEAD}}" 1>&2
+    git -C "$main" worktree add --no-track -b "$branch" "$dir" "$new_base" 1>&2
+    based=" (based on $new_base)"
   fi
-  log "created worktree '$name' on branch '$branch'${fresh_base:+ (based on $fresh_base)}"
+  log "created worktree '$name' on branch '$branch'$based"
 fi
 
 wt_sync --to "$dir" --from "$main"
