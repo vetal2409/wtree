@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment
+        run: |
+          uname -a
+          bash --version | head -1
+          git --version
+
+      - name: Syntax check
+        run: |
+          bash -n bin/wt
+          bash -n bin/wt-sync
+          bash -n contrib/wtc
+
+      - name: wt-sync suite
+        run: ./tests/wt-sync.test.sh
+
+      - name: wt suite
+        run: ./tests/wt.test.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - run: shellcheck --severity=warning bin/wt bin/wt-sync contrib/wtc tests/*.sh

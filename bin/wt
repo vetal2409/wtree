@@ -218,7 +218,17 @@ fetch_age() {
     printf 'never fetched\n'
     return 0
   fi
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || true)
+  # BSD's `stat -f FORMAT` and GNU's `-f` (a boolean --file-system flag)
+  # share a spelling, not a meaning: GNU parses `%m` as a second filename,
+  # fails on it (rc=1) — but still writes a filesystem-info block to stdout
+  # for "$f" first. The `||` fallback then runs and correctly appends the
+  # real epoch, but the leaked block is already ahead of it in `mtime`.
+  # Branch on platform instead.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mtime=$(stat -f %m "$f" 2>/dev/null || true)
+  else
+    mtime=$(stat -c %Y "$f" 2>/dev/null || true)
+  fi
   if [[ -z "$mtime" ]]; then
     printf 'fetch age unknown\n'
     return 0
@@ -793,7 +803,7 @@ $(printf '%-24s  %-46s  %4s  %s' NAME BRANCH AGE STATUS)" \
       cand_paths=()
       cand_branches=()
       cand_lines=()
-      while IFS=$'\t' read -r ts nm path br dirty ahead unpushed flags age; do
+      while IFS=$'\t' read -r _ nm path br dirty _ unpushed flags age; do
         [[ ",$flags," == *",safe,"* ]] || continue
         if [[ "$cwd_real" == "$path" || "$cwd_real" == "$path"/* ]]; then
           log "keeping '$nm': you are standing in it"

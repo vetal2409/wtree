@@ -124,6 +124,15 @@ assert_dir "$WT_ROOT/main/feature" "--fresh created the worktree"
   pass "--fresh fast-forwarded master in the main worktree" ||
   fail "--fresh left master behind"
 
+# ---- fetch age footer (regression: cross-platform stat in fetch_age) ----
+# `--fresh` above ran `git fetch`, so FETCH_HEAD now exists; this exercises
+# the BSD-vs-GNU `stat` branch in `fetch_age`, whose age computation went
+# silent-garbage on Linux (GNU `stat -f` means something else entirely).
+stderr=$(wt ls 2>&1 >/dev/null)
+assert_eq "$stderr" "" "wt ls prints nothing to stderr after a fetch"
+listing=$(wt ls)
+assert_match "$listing" 'fetched [0-9]+[smhdwy] ago' "footer reports fetch age after --fresh"
+
 # ---- flag guard rails ---------------------------------------------------
 set +e
 err=$(wt rm --merged feature 2>&1); rc=$?
