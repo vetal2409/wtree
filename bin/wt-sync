@@ -60,7 +60,7 @@ usage() {
   # Range spans the header comment block (line 2 .. the last '#' doc line);
   # bump the end line when the header grows so -h stays complete.
   sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
-  exit "${1:-0}"
+  exit 0
 }
 
 while [[ $# -gt 0 ]]; do

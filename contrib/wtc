@@ -61,7 +61,7 @@ usage() {
   # Print the header comment block: line 2 up to the first non-comment line,
   # so the range never drifts as the header grows.
   awk 'NR < 2 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
-  exit "${1:-0}"
+  exit 0
 }
 
 # Rename the workspace this shell is running in. Every failure mode is a
