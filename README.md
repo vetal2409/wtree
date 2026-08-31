@@ -2,7 +2,7 @@
 
 Git worktrees in one place — create them, sync the untracked state they need, and clean them up without losing work.
 
-`wtree` ships one command, `wt`. It keeps every worktree under one root (`$WT_ROOT`, default `~/worktrees`), brings across the untracked files a worktree needs in order to run, and can tell which worktrees are safe to delete.
+`wtree`'s main command is `wt`. It keeps every worktree under one root (`$WT_ROOT`, default `~/worktrees`), brings across the untracked files a worktree needs in order to run, and can tell which worktrees are safe to delete.
 
 ```console
 wt open fix-login    # create or reuse a worktree, sync it, print its path
@@ -76,9 +76,11 @@ Path matching:
 
 | Pattern | Meaning |
 |---|---|
-| bare name (no slash) | Depth pattern — matches every untracked/ignored path whose basename equals it, at any depth |
+| bare name (no slash) | Depth pattern — matches *ignored* paths only (per `git ls-files --others --ignored --exclude-standard`) whose basename equals it, at any depth |
 | leading `/` | Root-anchored literal (`/.env` = the root `.env` only) |
 | embedded `/` | Literal repo-relative path (`src/app/.env`) |
+
+An untracked file that is not gitignored will not match a depth pattern — `wt-sync` logs `skip <name> (no matches)` for it and leaves it alone.
 
 Example config:
 
@@ -89,6 +91,21 @@ link .claude/settings.local.json
 ```
 
 See [.worktreesync.example](.worktreesync.example) for a fuller, commented version. Every mode is idempotent, so `wt open` on an existing worktree is safe to re-run.
+
+### Running `wt-sync` standalone
+
+`wt open` runs `wt-sync` automatically, so most people never call it directly. It is a supporting command, not something you need day to day — but it is on `$PATH` alongside `wt`, and `wt sync` only forwards `--to`, so reach for it directly when you need the other flags:
+
+```
+wt-sync [<target-worktree>] [--to <path>] [--from <path>] [--dry-run] [--quiet]
+```
+
+| Flag | Meaning |
+|---|---|
+| `<target-worktree>` / `--to <path>` | Target worktree to populate (default: the worktree containing `$PWD`) |
+| `--from <path>` | Source worktree to read from (default: the repo's main worktree) |
+| `--dry-run` | Print what would happen without changing anything |
+| `--quiet` | Suppress the `[wt-sync] ...` progress log lines |
 
 ## What "safe to remove" means
 
