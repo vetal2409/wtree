@@ -2,6 +2,8 @@
 
 Git worktrees in one place — create them, sync the untracked state they need, and clean them up without losing work.
 
+[![CI](https://github.com/vetal2409/wtree/actions/workflows/ci.yml/badge.svg)](https://github.com/vetal2409/wtree/actions/workflows/ci.yml)
+
 `wtree`'s main command is `wt`. It keeps every worktree under one root (`$WT_ROOT`, default `~/worktrees`), brings across the untracked files a worktree needs in order to run, and can tell which worktrees are safe to delete.
 
 ```console
@@ -21,6 +23,8 @@ Clone to `~/development/wtree`:
 ```bash
 git clone https://github.com/vetal2409/wtree.git ~/development/wtree
 ```
+
+See [Releases](https://github.com/vetal2409/wtree/releases) for tagged versions and their changelogs; `main` is otherwise always safe to run.
 
 Then add to `~/.zshrc`:
 
@@ -134,6 +138,10 @@ Two caveats make this trustworthy: `wt-sync`'s payloads (`.env`, `node_modules`,
 | `.worktreesync.example` | Template to copy into a repo as `.worktreesync` |
 
 Everything in `bin/` runs on git and coreutils alone — `wt rm -i` additionally wants fzf and degrades with a clear error without it; integrations with specific editors, multiplexers, or agents belong in `contrib/`.
+
+## Contributing
+
+Bug reports, feature requests and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to run the tests and the `bin/`-stays-dependency-free rule. This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
