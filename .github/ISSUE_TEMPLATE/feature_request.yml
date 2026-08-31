@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest something wtree should do.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: >
+        Describe the problem, not the fix — what are you trying to get done,
+        and where does the tool currently get in the way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What do you do today instead?
+      description: The manual steps, script, or alias you currently use to work around this.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution (optional)
+      description: If you have an idea of how this should work, describe it here.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: >
+            I understand that `bin/` (`wt`, `wt-sync`) cannot take on new
+            dependencies beyond git and coreutils — fzf is the one existing
+            exception, used only by `wt rm -i`. A feature that needs
+            something else belongs in `contrib/` instead.
+          required: true

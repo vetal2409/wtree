@@ -14,8 +14,12 @@
 #           survives worktree deletion. Refuses to clobber a diverged file.
 #
 # Path matching:
-#   .env          no slash   -> depth pattern: every untracked/ignored path
-#                              whose basename is `.env`, at any depth
+#   .env          no slash   -> depth pattern: matches ignored paths only
+#                              (per `git ls-files --others --ignored
+#                              --exclude-standard`) whose basename is `.env`,
+#                              at any depth. An untracked-but-not-gitignored
+#                              `.env` will NOT match; wt-sync logs
+#                              "skip .env (no matches)" for it.
 #   /.env         leading /  -> root-anchored literal: the root .env only
 #   src/app/.env  other /    -> literal repo-relative path
 #

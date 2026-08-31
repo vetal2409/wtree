@@ -124,6 +124,15 @@ assert_dir "$WT_ROOT/main/feature" "--fresh created the worktree"
   pass "--fresh fast-forwarded master in the main worktree" ||
   fail "--fresh left master behind"
 
+# ---- fetch age footer (regression: cross-platform stat in fetch_age) ----
+# `--fresh` above ran `git fetch`, so FETCH_HEAD now exists; this exercises
+# the BSD-vs-GNU `stat` branch in `fetch_age`, whose age computation went
+# silent-garbage on Linux (GNU `stat -f` means something else entirely).
+stderr=$(wt ls 2>&1 >/dev/null)
+assert_eq "$stderr" "" "wt ls prints nothing to stderr after a fetch"
+listing=$(wt ls)
+assert_match "$listing" 'fetched [0-9]+[smhdwy] ago' "footer reports fetch age after --fresh"
+
 # ---- flag guard rails ---------------------------------------------------
 set +e
 err=$(wt rm --merged feature 2>&1); rc=$?
@@ -267,6 +276,17 @@ assert_eq "$(git -C "$WT_ROOT/main/detached-base" rev-parse HEAD)" "$det" \
 (cd "$WT_ROOT/main/dirty" && "$WT" -C "$main" open -b . from-ctx >/dev/null 2>&1)
 assert_eq "$(git -C "$WT_ROOT/main/from-ctx" rev-parse HEAD)" \
   "$(git -C "$main" rev-parse HEAD)" "-b . resolves against -C, not the cwd"
+
+# --- version -----------------------------------------------------------------
+# Derived from wt's own WT_VERSION constant, not hardcoded: a release bumps
+# that constant, and a literal here would fail every release after 0.1.0.
+ver=$(sed -n 's/^WT_VERSION="\(.*\)"$/\1/p' "$WT")
+assert_match "$ver" '^[0-9]+\.[0-9]+\.[0-9]+$' "WT_VERSION is semver"
+out=$("$WT" --version)
+assert_eq "$out" "wt $ver" "wt --version prints name and WT_VERSION"
+out=$("$WT" -V)
+assert_eq "$out" "wt $ver" "wt -V is the same as --version"
+assert_match "$("$WT" -h)" "--version" "wt -h documents --version"
 
 # ---- summary ------------------------------------------------------------
 if [[ "$fails" -eq 0 ]]; then

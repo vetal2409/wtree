@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Suites
+        run: |
+          ./tests/wt-sync.test.sh
+          ./tests/wt.test.sh
+
+      - name: Version constants match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          fail=0
+          for f in bin/wt bin/wt-sync contrib/wtc; do
+            got=$(sed -n 's/^WT_VERSION="\(.*\)"$/\1/p' "$f")
+            if [ "$got" != "$tag" ]; then
+              echo "::error file=$f::WT_VERSION is '$got' but the tag is '$tag'"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract this version's changelog section
+        id: notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && /^## \[/ { exit }
+            grab { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::No CHANGELOG section found for $version"
+            exit 1
+          fi
+          cat release-notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

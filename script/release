@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# release — cut a new wtree release: verify, bump, changelog, commit, tag.
+#
+# Usage:  script/release <version>        e.g. script/release 0.1.0
+#
+# Does NOT push. Publishing a release is irreversible, so the final step
+# stays a deliberate human action; the command to run is printed at the end.
+set -euo pipefail
+
+die() { printf 'release: ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf 'release: %s\n' "$*" >&2; }
+
+[[ $# -eq 1 ]] || die "usage: script/release <version>"
+version="$1"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  die "version must be X.Y.Z (got '$version')"
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+[[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
+branch=$(git branch --show-current)
+[[ "$branch" == "main" ]] || die "must be on main (on '$branch')"
+
+git fetch --quiet origin main
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] ||
+  die "main and origin/main differ; push or pull first"
+
+tag="v$version"
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null &&
+  die "tag $tag already exists locally"
+[[ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ]] ||
+  die "tag $tag already exists on origin"
+
+grep -q '^## \[Unreleased\]$' CHANGELOG.md ||
+  die "CHANGELOG.md has no '## [Unreleased]' section"
+grep -q "^## \[$version\]" CHANGELOG.md &&
+  die "CHANGELOG.md already has a [$version] section (previous run interrupted?)"
+
+log "running test suites"
+./tests/wt-sync.test.sh >/dev/null || die "wt-sync suite failed"
+./tests/wt.test.sh >/dev/null || die "wt suite failed"
+
+log "bumping WT_VERSION to $version"
+for f in bin/wt bin/wt-sync contrib/wtc; do
+  grep -q '^WT_VERSION=' "$f" || die "$f has no WT_VERSION constant"
+  # Write through a temp file, then copy its contents back over the
+  # original (rather than mv'ing the temp file over it) so the original's
+  # mode and inode are preserved — no separate chmod step needed.
+  sed "s/^WT_VERSION=.*/WT_VERSION=\"$version\"/" "$f" >"$f.tmp"
+  cat "$f.tmp" >"$f"
+  rm -f "$f.tmp"
+done
+
+log "updating CHANGELOG.md"
+today=$(date +%Y-%m-%d)
+awk -v ver="$version" -v date="$today" '
+  /^## \[Unreleased\]$/ {
+    print "## [Unreleased]"
+    print ""
+    print "## [" ver "] - " date
+    next
+  }
+  { print }
+' CHANGELOG.md >CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+
+git add bin/wt bin/wt-sync contrib/wtc CHANGELOG.md
+git commit -m "release: $tag"
+git tag -a "$tag" -m "$tag"
+
+log "committed and tagged $tag"
+printf '\nNothing has been pushed. To publish:\n\n    git push origin main --follow-tags\n\n' >&2

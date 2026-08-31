@@ -12,6 +12,8 @@ pass() { printf 'ok   - %s\n' "$1"; }
 fail() { printf 'FAIL - %s\n' "$1" >&2; fails=$((fails + 1)); }
 assert_file()   { [[ -f "$1" ]] && pass "$2" || fail "$2 (missing: $1)"; }
 assert_absent() { [[ ! -e "$1" ]] && pass "$2" || fail "$2 (unexpected: $1)"; }
+assert_eq() { [[ "$1" == "$2" ]] && pass "$3" || fail "$3 (want '$2', got '$1')"; }
+assert_match() { grep -Eq -- "$2" <<<"$1" && pass "$3" || fail "$3 (no match for '$2' in: $1)"; }
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -83,6 +85,16 @@ run2=$("$WT_SYNC" --to "$wt" --from "$repo" 2>&1)
 grep -qE 'copied|cloned|symlinked' <<<"$run2" \
   && fail "idempotent: second run changed things: $run2" \
   || pass "idempotent: second run made no changes"
+
+# --- version -----------------------------------------------------------------
+# Derived from wt-sync's own WT_VERSION constant, not hardcoded: a release
+# bumps that constant, and a literal here would fail every release after
+# 0.1.0.
+ver=$(sed -n 's/^WT_VERSION="\(.*\)"$/\1/p' "$WT_SYNC")
+assert_match "$ver" '^[0-9]+\.[0-9]+\.[0-9]+$' "WT_VERSION is semver"
+out=$("$WT_SYNC" --version)
+assert_eq "$out" "wt-sync $ver" "wt-sync --version prints name and WT_VERSION"
+assert_match "$("$WT_SYNC" -h)" "--version" "wt-sync -h documents --version"
 
 # ---- summary --------------------------------------------------------------
 if [[ "$fails" -gt 0 ]]; then
