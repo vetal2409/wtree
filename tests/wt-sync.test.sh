@@ -87,8 +87,13 @@ grep -qE 'copied|cloned|symlinked' <<<"$run2" \
   || pass "idempotent: second run made no changes"
 
 # --- version -----------------------------------------------------------------
+# Derived from wt-sync's own WT_VERSION constant, not hardcoded: a release
+# bumps that constant, and a literal here would fail every release after
+# 0.1.0.
+ver=$(sed -n 's/^WT_VERSION="\(.*\)"$/\1/p' "$WT_SYNC")
+assert_match "$ver" '^[0-9]+\.[0-9]+\.[0-9]+$' "WT_VERSION is semver"
 out=$("$WT_SYNC" --version)
-assert_eq "$out" "wt-sync 0.1.0" "wt-sync --version prints name and version"
+assert_eq "$out" "wt-sync $ver" "wt-sync --version prints name and WT_VERSION"
 assert_match "$("$WT_SYNC" -h)" "--version" "wt-sync -h documents --version"
 
 # ---- summary --------------------------------------------------------------

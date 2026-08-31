@@ -278,10 +278,14 @@ assert_eq "$(git -C "$WT_ROOT/main/from-ctx" rev-parse HEAD)" \
   "$(git -C "$main" rev-parse HEAD)" "-b . resolves against -C, not the cwd"
 
 # --- version -----------------------------------------------------------------
+# Derived from wt's own WT_VERSION constant, not hardcoded: a release bumps
+# that constant, and a literal here would fail every release after 0.1.0.
+ver=$(sed -n 's/^WT_VERSION="\(.*\)"$/\1/p' "$WT")
+assert_match "$ver" '^[0-9]+\.[0-9]+\.[0-9]+$' "WT_VERSION is semver"
 out=$("$WT" --version)
-assert_eq "$out" "wt 0.1.0" "wt --version prints name and version"
+assert_eq "$out" "wt $ver" "wt --version prints name and WT_VERSION"
 out=$("$WT" -V)
-assert_eq "$out" "wt 0.1.0" "wt -V is the same as --version"
+assert_eq "$out" "wt $ver" "wt -V is the same as --version"
 assert_match "$("$WT" -h)" "--version" "wt -h documents --version"
 
 # ---- summary ------------------------------------------------------------

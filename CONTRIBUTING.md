@@ -83,3 +83,30 @@ scope this project uses.
 Branch off `main`, open a PR against `main`, and make sure CI is green on
 both macOS and Linux before asking for review. If your change touches
 `bin/` or `contrib/`, run both test suites locally first — see above.
+
+## Cutting a release
+
+Releases are cut with `script/release`, run from a clean `main` that's
+up to date with `origin/main`:
+
+```bash
+script/release X.Y.Z
+```
+
+It runs both test suites, bumps `WT_VERSION` in `bin/wt`, `bin/wt-sync` and
+`contrib/wtc`, promotes the CHANGELOG's `## [Unreleased]` section to
+`## [X.Y.Z] - YYYY-MM-DD` and opens a fresh empty `Unreleased` above it, then
+commits and tags `vX.Y.Z` locally.
+
+Review the commit and tag it produced, then publish:
+
+```bash
+git push origin main --follow-tags
+```
+
+The script deliberately does not push — publishing a release is
+irreversible, so that stays a separate, deliberate step. Pushing the tag
+triggers `.github/workflows/release.yml`, which re-runs both test suites on
+macOS and Linux, checks that each script's `WT_VERSION` matches the tag, and
+then publishes the GitHub Release using the matching CHANGELOG section as
+its notes.
